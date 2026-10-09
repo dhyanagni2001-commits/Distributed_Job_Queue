@@ -261,3 +261,87 @@ BEGIN
     RETURN moved;
 END;
 $$;
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Batched claim: claims up to p_limit jobs, marks them running, and writes
+-- their claimed/started events in a single round trip.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION claim_jobs(
+    p_worker_id   TEXT,
+    p_queue_names TEXT[],
+    p_lease_sec   INTEGER,
+    p_limit       INTEGER
+)
+RETURNS TABLE (
+    out_job_id        UUID,
+    out_job_type      TEXT,
+    out_payload       JSONB,
+    out_attempt_count INTEGER,
+    out_max_attempts  INTEGER
+)
+LANGUAGE sql AS $$
+    WITH picked AS (
+        SELECT id FROM jobs
+        WHERE queue_name = ANY(p_queue_names)
+          AND status = 'pending'
+          AND scheduled_at <= NOW()
+        ORDER BY priority ASC, scheduled_at ASC
+        LIMIT p_limit
+        FOR UPDATE SKIP LOCKED
+    ), upd AS (
+        UPDATE jobs j SET
+            status           = 'running',
+            worker_id        = p_worker_id,
+            lease_expires_at = NOW() + make_interval(secs => p_lease_sec),
+            claimed_at       = NOW(),
+            started_at       = NOW(),
+            attempt_count    = j.attempt_count + 1,
+            updated_at       = NOW()
+        FROM picked WHERE j.id = picked.id
+        RETURNING j.id, j.job_type, j.payload, j.attempt_count, j.max_attempts,
+                  j.priority, j.scheduled_at
+    ), ev AS (
+        INSERT INTO job_events (job_id, worker_id, event_type, message)
+        SELECT id, p_worker_id, 'claimed',
+               'Claimed by worker ' || p_worker_id || ' (attempt ' || attempt_count || ')'
+        FROM upd
+        UNION ALL
+        SELECT id, p_worker_id, 'started', 'Execution started' FROM upd
+    )
+    SELECT id, job_type, payload, attempt_count, max_attempts
+    FROM upd ORDER BY priority ASC, scheduled_at ASC;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Batched completion: marks jobs completed, writes completed events, and
+-- updates the worker's counter in a single round trip.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION complete_jobs(
+    p_worker_id TEXT,
+    p_job_ids   UUID[],
+    p_results   JSONB[],
+    p_durations FLOAT8[]
+)
+RETURNS INTEGER
+LANGUAGE sql AS $$
+    WITH input AS (
+        SELECT * FROM unnest(p_job_ids, p_results, p_durations) AS t(id, result, duration)
+    ), upd AS (
+        UPDATE jobs j SET
+            status       = 'completed',
+            result       = input.result,
+            completed_at = NOW(),
+            updated_at   = NOW(),
+            worker_id    = NULL
+        FROM input WHERE j.id = input.id
+        RETURNING j.id, input.duration
+    ), ev AS (
+        INSERT INTO job_events (job_id, event_type, message, metadata)
+        SELECT id, 'completed', 'Completed in ' || round(duration::numeric, 3) || 's',
+               jsonb_build_object('duration_sec', duration)
+        FROM upd
+    ), stats AS (
+        UPDATE workers SET jobs_processed = jobs_processed + (SELECT COUNT(*) FROM upd)
+        WHERE id = p_worker_id
+    )
+    SELECT COUNT(*)::INTEGER FROM upd;
+$$;

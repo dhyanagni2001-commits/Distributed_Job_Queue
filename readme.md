@@ -4,6 +4,13 @@ A distributed job-processing system that uses PostgreSQL to coordinate multiple 
 
 The project explores how background job systems handle concurrent claiming, retries, worker failures, lease renewal, dead-lettered jobs, and operational monitoring. It is intended for moderate workloads where PostgreSQL is already part of the application stack.
 
+**Measured results** (no-op handlers, single machine; see [Benchmarks](#benchmarks)):
+
+- About 17,800 jobs/s sustained over 100,000 jobs with 16 workers, 16x faster than the original one-job-per-claim design (about 1,100 jobs/s)
+- About 37,000–40,000 jobs/s bulk enqueue with idempotency-key deduplication
+- Claiming a job takes about 1.05 ms typical (p50) and under 1.5 ms for the slowest 1% (p99)
+- Zero duplicate completions across all benchmark runs
+
 ## Motivation
 
 Applications often need to run work that should not block an API request, such as processing files, generating reports, or sending notifications. Existing tools such as Celery already support these workflows, but I wanted to understand the coordination mechanisms behind them.
@@ -19,6 +26,8 @@ I built this project to explore the following questions:
 ## Features
 
 - Concurrent job claiming with `SELECT FOR UPDATE SKIP LOCKED`
+- Batched claim and completion (one SQL round trip per batch)
+- Bulk enqueue with idempotency-key deduplication
 - Multiple asynchronous workers
 - Lease-based recovery of interrupted jobs
 - Periodic lease renewal for long-running jobs
@@ -53,10 +62,10 @@ PostgreSQL stores both the job data and its processing state. Workers use row-le
 ## Job Lifecycle
 
 1. A producer inserts a pending job.
-2. A worker atomically selects and claims an available job.
-3. The worker records a lease expiration time before executing the handler.
-4. Long-running handlers periodically renew their leases.
-5. Successful jobs are marked as completed.
+2. A worker atomically claims a batch of up to `BATCH_SIZE` available jobs, marks them running, sets their lease expiration, and logs their events in a single SQL statement.
+3. The worker runs the handlers in the batch concurrently.
+4. While the batch runs, the worker periodically renews the leases for all of its jobs.
+5. Successful jobs are marked as completed together in one statement.
 6. Failed jobs return to the queue after a configured delay.
 7. Jobs that exhaust their allowed attempts are moved to the dead-letter state.
 8. If a worker stops and its lease expires, another worker can recover the job.
@@ -161,6 +170,7 @@ Configuration values are defined in `config.py` and can be overridden with envir
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
+| `BATCH_SIZE` | `10` | Jobs claimed per poll; jobs in a batch run concurrently |
 | `poll_interval_sec` | `1.0` | Delay between polls when no job is available |
 | `lease_duration_sec` | `30` | Initial period for which a worker owns a job |
 | `lease_renewal_interval_sec` | `10` | Frequency of lease renewal during execution |
@@ -206,28 +216,50 @@ These tests validate the scenarios implemented in this repository. They are not 
 
 ## Benchmarks
 
-Measured with `benchmark.py` on an Apple M5 Pro (15 cores), PostgreSQL 16 in Docker, Python 3.11, asyncpg 0.29. Workers ran as asyncio tasks in one process and shared one connection pool (max 40). Handlers are no-ops, so these numbers show the queue's overhead and do not include any real work. The table shows two runs of 2,000 jobs each.
+Measured with `benchmark.py` on an Apple M5 Pro, PostgreSQL 16 in Docker (6 vCPUs, default durability settings: `fsync` and `synchronous_commit` left on), Python 3.11, asyncpg 0.29. Handlers are no-ops, so these numbers show the queue's overhead and do not include any real work. Each run starts with a pre-filled queue and is timed until the last job completes. The tables show two full runs.
+
+### Throughput
+
+| Workers | Batch size | Jobs | Run 1 (jobs/s) | Run 2 (jobs/s) | Duplicate completions |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 2,000 | 471 | 464 | 0 |
+| 16 | 1 | 10,000 | 2,069 | 2,021 | 0 |
+| 16 | 10 | 20,000 | 13,159 | 13,185 | 0 |
+| 16 | 50 | 50,000 | 26,610 | 24,174 | 0 |
+| 16 (4 processes × 4) | 50 | 50,000 | 26,327 | 26,019 | 0 |
+| 16 | 50 | 100,000 | 17,779 | 17,778 | 0 |
+
+### Enqueue and claim
 
 | Metric | Run 1 | Run 2 |
 | --- | ---: | ---: |
-| Enqueue rate (single producer, sequential) | 919 jobs/s | 865 jobs/s |
-| Claim latency p50 / p99 | 1.21 / 1.92 ms | 1.30 / 1.65 ms |
-| Throughput, 1 worker | 162 jobs/s | 162 jobs/s |
-| Throughput, 2 workers | 401 jobs/s | 393 jobs/s |
-| Throughput, 4 workers | 551 jobs/s | 612 jobs/s |
-| Throughput, 8 workers | 825 jobs/s | 773 jobs/s |
-| Throughput, 16 workers | 1,119 jobs/s | 1,116 jobs/s |
-| Duplicate completions (all runs) | 0 | 0 |
+| Single-row enqueue (sequential) | 964 jobs/s | 931 jobs/s |
+| Bulk enqueue (`enqueue_many`, 1,000 per call) | 39,925 jobs/s | 36,937 jobs/s |
+| Claim latency p50 / p99 (1 job) | 1.05 / 1.45 ms | 1.06 / 1.32 ms |
 
-Throughput goes up as workers are added (about 6.9x from 1 to 16 workers), but each added worker contributes less. A single worker makes about 6 database round trips per job (claim, event log, mark running, heartbeat, complete, stats), so it is limited by round-trip latency. With 16 workers, contention on PostgreSQL becomes the limit. Your numbers will differ on other hardware or with real handlers.
+### Before and after batching
 
-The `chaos_test.py` suite passes all 5 scenarios (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, and 25-second lease renewal). The full suite takes about 30 seconds.
+The first version handled one job per claim and made about 9 database round trips per job (claim, 3 event inserts, mark running, 2 heartbeats, complete, stats). The current version uses `claim_jobs()` to claim N jobs, mark them running, and log their events in one SQL statement. It runs the batch concurrently, then records all successes with one `complete_jobs()` call.
+
+| Setup (same machine, no-op handlers) | Before | After |
+| --- | ---: | ---: |
+| 1 worker | 162 jobs/s | ~470 jobs/s (2.9x) |
+| 16 workers | ~1,116 jobs/s | ~17,800 jobs/s sustained over 100k jobs (16x), 24–27k jobs/s over 50k |
+
+### Observations
+
+- In the 50k runs, PostgreSQL used about 470% CPU, and results were the same whether workers ran in 1 or 4 Python processes. The database is the limit, not Python.
+- The 100k run is about 30% slower than the 50k run. Completed rows leave dead entries in the partial `pending` index until autovacuum removes them, so later claims scan more. This is a known cost of PostgreSQL-backed queues.
+- Batching trades per-job latency for throughput. A batch holds its leases until every job in it finishes, so slow and fast jobs should not share a queue with a large batch size.
+- None of the runs produced a duplicate completion.
+
+The `chaos_test.py` suite passes all 5 scenarios with batching enabled (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, and 25-second lease renewal).
 
 Reproduce:
 
 ```bash
 docker run -d --name djq-bench -e POSTGRES_DB=jobqueue2 -e POSTGRES_USER=jobqueue \
-  -e POSTGRES_PASSWORD=jobqueue -p 5439:5432 postgres:16-alpine
+  -e POSTGRES_PASSWORD=jobqueue -p 5439:5432 postgres:16-alpine -c max_connections=200
 export DB_PORT=5439 DB_USER=jobqueue DB_PASSWORD=jobqueue
 python benchmark.py
 python chaos_test.py
@@ -279,6 +311,8 @@ Possible future improvements include:
 - Load tests with real (non-no-op) handlers and workers spread across separate processes and hosts
 - Fairness controls to reduce priority starvation
 - PostgreSQL `LISTEN/NOTIFY` to reduce idle polling
+- Partitioning or more aggressive autovacuum for the `jobs` table to reduce dead-index-entry overhead on long runs
+- Releasing each job's lease as soon as it finishes, so slow jobs do not hold a whole batch
 - Retention and archival policies for completed jobs
 - Graceful shutdown tests during different stages of execution
 - Handler examples demonstrating idempotent external side effects
@@ -312,3 +346,5 @@ Possible future improvements include:
 Building this queue helped me understand that preventing concurrent claims is different from guaranteeing exactly-once side effects.
 
 It also helped me explore how retry behavior, lease timing, database contention, worker recovery, and observability affect a distributed job-processing system.
+
+Benchmarking showed that the first version was limited by database round trips, not by locking: each job needed about 9 separate queries. Batching claims and completions removed most of that overhead. After that change, PostgreSQL CPU usage and dead index entries from completed jobs became the main limits.

@@ -27,7 +27,7 @@ class DatabaseConfig:
 class QueueConfig:
     # Polling
     poll_interval_sec: float = 1.0
-    batch_size: int = 1  # jobs to claim per poll cycle
+    batch_size: int = int(os.getenv("BATCH_SIZE", "10"))  # jobs to claim per poll cycle
 
     # Leasing
     lease_duration_sec: int = 30

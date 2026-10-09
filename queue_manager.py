@@ -78,6 +78,42 @@ class QueueManager:
             ids.append(await self.enqueue(job))
         return ids
 
+    async def enqueue_many(self, jobs: List[Job]) -> int:
+        """Bulk insert in one round trip. Duplicate idempotency keys are skipped.
+        Returns the number of newly inserted jobs."""
+        if not jobs:
+            return 0
+        async with acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                WITH ins AS (
+                    INSERT INTO jobs (
+                        queue_name, job_type, payload, priority,
+                        max_attempts, retry_delay_sec, idempotency_key
+                    )
+                    SELECT * FROM unnest(
+                        $1::text[], $2::text[], $3::jsonb[], $4::int[],
+                        $5::int[], $6::int[], $7::text[]
+                    )
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, queue_name
+                ), ev AS (
+                    INSERT INTO job_events (job_id, event_type, message)
+                    SELECT id, 'enqueued', 'Job enqueued to queue ''' || queue_name || ''''
+                    FROM ins
+                )
+                SELECT COUNT(*) AS n FROM ins
+                """,
+                [j.queue_name for j in jobs],
+                [j.job_type for j in jobs],
+                [j.payload for j in jobs],
+                [j.priority for j in jobs],
+                [j.max_attempts for j in jobs],
+                [j.retry_delay_sec for j in jobs],
+                [j.idempotency_key for j in jobs],
+            )
+            return row["n"]
+
     # ------------------------------------------------------------------
     # Claim
     # ------------------------------------------------------------------
@@ -111,6 +147,57 @@ class QueueManager:
                 max_attempts=row["out_max_attempts"],
                 worker_id=worker_id,
             )
+
+    async def claim_jobs(
+        self,
+        worker_id: str,
+        queue_names: List[str],
+        lease_sec: int = 30,
+        limit: int = 10,
+    ) -> List[ClaimedJob]:
+        """Claim up to `limit` jobs and mark them running in one round trip."""
+        async with acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM claim_jobs($1, $2, $3, $4)",
+                worker_id, queue_names, lease_sec, limit,
+            )
+        return [
+            ClaimedJob(
+                job_id=r["out_job_id"],
+                job_type=r["out_job_type"],
+                payload=r["out_payload"],
+                attempt_count=r["out_attempt_count"],
+                max_attempts=r["out_max_attempts"],
+                worker_id=worker_id,
+            )
+            for r in rows
+        ]
+
+    async def complete_jobs(self, worker_id: str, results: List[JobResult]) -> int:
+        """Mark a batch of jobs completed in one round trip."""
+        if not results:
+            return 0
+        async with acquire() as conn:
+            return await conn.fetchval(
+                "SELECT complete_jobs($1, $2, $3, $4)",
+                worker_id,
+                [r.job_id for r in results],
+                [r.result or {} for r in results],
+                [r.duration_sec for r in results],
+            )
+
+    async def renew_leases(self, job_ids: List[uuid.UUID], worker_id: str,
+                           lease_sec: int = 30) -> int:
+        async with acquire() as conn:
+            res = await conn.execute(
+                """
+                UPDATE jobs SET lease_expires_at = NOW() + make_interval(secs => $3),
+                                updated_at = NOW()
+                WHERE id = ANY($1) AND worker_id = $2 AND status = 'running'
+                """,
+                job_ids, worker_id, lease_sec,
+            )
+            return int(res.split()[-1])
 
     # ------------------------------------------------------------------
     # Mark running

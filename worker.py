@@ -92,13 +92,14 @@ class Worker:
     async def _poll_loop(self):
         while self._running:
             try:
-                claimed = await self.qm.claim_job(
+                batch = await self.qm.claim_jobs(
                     self.worker_id,
                     self.queue_names,
                     lease_sec=config.queue.lease_duration_sec,
+                    limit=config.queue.batch_size,
                 )
-                if claimed:
-                    await self._execute(claimed)
+                if batch:
+                    await self._execute_batch(batch)
                 else:
                     await asyncio.sleep(config.queue.poll_interval_sec)
             except asyncio.CancelledError:
@@ -156,6 +157,52 @@ class Worker:
         finally:
             self._current_job = None
             await self.qm.heartbeat(self.worker_id, "idle", None)
+
+    async def _execute_batch(self, batch: list[ClaimedJob]):
+        """Run a claimed batch concurrently; successes are recorded in one
+        round trip, failures go through the per-job retry path."""
+        self._current_job = batch[0]
+        lease_task = asyncio.create_task(self._batch_lease_renewal_loop(batch))
+        try:
+            outcomes = await asyncio.gather(*(self._run_handler(j) for j in batch))
+        finally:
+            lease_task.cancel()
+
+        successes = [r for r in outcomes if r is not None]
+        await self.qm.complete_jobs(self.worker_id, successes)
+        self.processed += len(successes)
+        self._current_job = None
+
+    async def _run_handler(self, job: ClaimedJob) -> Optional[JobResult]:
+        handler = self._handlers.get(job.job_type)
+        if handler is None:
+            await self._handle_failure(
+                job, error=f"No handler registered for job_type='{job.job_type}'", duration=0)
+            return None
+        start = time.monotonic()
+        try:
+            result_data = await handler(job.payload)
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            await self._handle_failure(job, error=error_msg, duration=time.monotonic() - start)
+            return None
+        duration = time.monotonic() - start
+        logger.debug("✓ Job %s [%s] completed in %.3fs (attempt %d)",
+                     job.job_id, job.job_type, duration, job.attempt_count)
+        return JobResult(job_id=job.job_id, success=True,
+                         result=result_data or {}, duration_sec=duration)
+
+    async def _batch_lease_renewal_loop(self, batch: list[ClaimedJob]):
+        ids = [j.job_id for j in batch]
+        while True:
+            await asyncio.sleep(config.queue.lease_renewal_interval_sec)
+            try:
+                await self.qm.renew_leases(ids, self.worker_id,
+                                           lease_sec=config.queue.lease_duration_sec)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Lease renewal error for batch")
 
     async def _handle_failure(self, job: ClaimedJob, error: str, duration: float):
         self.failed += 1
