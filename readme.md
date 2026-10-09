@@ -8,8 +8,9 @@ The project explores how background job systems handle concurrent claiming, retr
 
 - About 17,800 jobs/s sustained over 100,000 jobs with 16 workers, 16x faster than the original one-job-per-claim design (about 1,100 jobs/s)
 - About 37,000–40,000 jobs/s bulk enqueue with idempotency-key deduplication
-- Claiming a job takes about 1.05 ms typical (p50) and under 1.5 ms for the slowest 1% (p99)
-- Zero duplicate completions across all benchmark runs
+- Claim latency: p50 1.05–1.06 ms, p99 1.32–1.45 ms
+- Zero duplicate completions across all benchmark runs (see [definition](#how-duplicates-are-detected))
+- A job held by a SIGKILLed worker process was recovered and completed 5.1 s after the kill, with a 6 s lease
 
 ## Motivation
 
@@ -204,13 +205,16 @@ The failure-oriented test suite covers:
 - Exclusive claiming with concurrent workers
 - Retry exhaustion and dead-letter handling
 - Priority-based job selection
-- Lease behavior during longer-running jobs
+- Lease renewal for a 25-second job
+- Crash recovery: a worker running in a separate OS process is killed with SIGKILL mid-job, and the test checks that another worker recovers and completes the job after the lease expires
 
 Run the tests with:
 
 ```bash
 python chaos_test.py
 ```
+
+The script exits with a non-zero status if any scenario fails. GitHub Actions (`.github/workflows/ci.yml`) runs the full suite against a PostgreSQL 16 service container on every push to `main` and on every pull request.
 
 These tests validate the scenarios implemented in this repository. They are not a formal proof of exactly-once execution or production reliability.
 
@@ -248,12 +252,16 @@ The first version handled one job per claim and made about 9 database round trip
 
 ### Observations
 
-- In the 50k runs, PostgreSQL used about 470% CPU, and results were the same whether workers ran in 1 or 4 Python processes. The database is the limit, not Python.
-- The 100k run is about 30% slower than the 50k run. Completed rows leave dead entries in the partial `pending` index until autovacuum removes them, so later claims scan more. This is a known cost of PostgreSQL-backed queues.
+- In the 50k runs, PostgreSQL used about 470% CPU, and results were the same whether workers ran in 1 or 4 Python processes. These results suggest a database bottleneck rather than a Python one.
+- The 100k run is about 30% slower than the 50k run, which was consistent across both runs. A likely explanation, not yet verified, is that completed rows leave dead entries in the partial `pending` index until autovacuum removes them, so later claims scan more. Comparing `EXPLAIN (ANALYZE, BUFFERS)` output for the claim query early and late in a run would confirm or rule this out.
 - Batching trades per-job latency for throughput. A batch holds its leases until every job in it finishes, so slow and fast jobs should not share a queue with a large batch size.
 - None of the runs produced a duplicate completion.
 
-The `chaos_test.py` suite passes all 5 scenarios with batching enabled (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, and 25-second lease renewal).
+### How duplicates are detected
+
+A duplicate completion is a job with more than one `completed` row in `job_events`. The benchmark checks this after every run by grouping completed events by `job_id` (`HAVING COUNT(*) > 1`). This detects a job that the queue marked complete twice. It cannot detect a handler side effect that ran twice before a crash.
+
+The `chaos_test.py` suite passes all 6 scenarios with batching enabled (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, 25-second lease renewal, and recovery after a worker process is SIGKILLed).
 
 Reproduce:
 
@@ -307,7 +315,7 @@ It focuses on PostgreSQL-backed job coordination and does not attempt to provide
 
 Possible future improvements include:
 
-- Automated unit and integration tests in CI
+- Unit tests for individual queue operations
 - Load tests with real (non-no-op) handlers and workers spread across separate processes and hosts
 - Fairness controls to reduce priority starvation
 - PostgreSQL `LISTEN/NOTIFY` to reduce idle polling
@@ -331,6 +339,7 @@ Possible future improvements include:
 ├── main.py                 # Entry point and example handlers
 ├── prometheus_exporter.py  # Prometheus metrics endpoint
 ├── chaos_test.py           # Failure-oriented test scenarios
+├── .github/workflows/ci.yml # Runs chaos_test.py on push and pull requests
 ├── benchmark.py            # Throughput and claim-latency benchmark
 ├── abstract_backend.py     # Queue backend interface
 ├── scale_story.md          # Notes about scaling considerations
@@ -347,4 +356,4 @@ Building this queue helped me understand that preventing concurrent claims is di
 
 It also helped me explore how retry behavior, lease timing, database contention, worker recovery, and observability affect a distributed job-processing system.
 
-Benchmarking showed that the first version was limited by database round trips, not by locking: each job needed about 9 separate queries. Batching claims and completions removed most of that overhead. After that change, PostgreSQL CPU usage and dead index entries from completed jobs became the main limits.
+Benchmarking showed that the first version was limited by database round trips, not by locking: each job needed about 9 separate queries. Batching claims and completions removed most of that overhead. After that change, PostgreSQL CPU usage appears to be the main limit, and the throughput drop on longer runs is likely related to dead index entries, though that is not yet verified.

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  chaos-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: jobqueue2
+          POSTGRES_USER: jobqueue
+          POSTGRES_PASSWORD: jobqueue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobqueue -d jobqueue2"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: jobqueue2
+      DB_USER: jobqueue
+      DB_PASSWORD: jobqueue
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run failure-scenario tests
+        run: python chaos_test.py
+        timeout-minutes: 5

@@ -1,15 +1,18 @@
 # chaos_test.py
 # Fault-tolerance test suite. Proves: crash recovery, idempotency,
-# exactly-once execution, and retry/dead-letter behavior.
+# exclusive claiming, and retry/dead-letter behavior.
 # Run: python chaos_test.py
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing as mp
+import sys
 import time
 import uuid
 
+from config import config
 from database import apply_schema, close_pool, fetch_all, fetch_one, init_pool
 from models import Job
 from queue_manager import QueueManager
@@ -266,74 +269,82 @@ async def test_lease_renewal(qm: QueueManager) -> str:
 
 
 # ── Test 6: Crash recovery (requires short lease in config) ──────────────────
+def _victim_process(queue: str):
+    """Runs in a separate OS process; claims the job and hangs until killed."""
+    async def run():
+        config.queue.lease_duration_sec = 6
+        config.queue.lease_renewal_interval_sec = 2
+        await init_pool()
+        victim = Worker(QueueManager(), queue_names=[queue], worker_id="victim-worker")
+
+        async def handle_never_finishes(payload):
+            await asyncio.sleep(9999)
+
+        victim.register_handler("crash_job", handle_never_finishes)
+        await victim.start()
+    asyncio.run(run())
+
+
 async def test_crash_recovery(qm: QueueManager) -> str:
     logger.info("─" * 55)
-    logger.info("TEST 6: Worker crash recovery")
-    logger.info("  NOTE: Set lease_duration_sec=8, recovery_interval_sec=5")
-    logger.info("        in config.py for this test to run fast")
+    logger.info("TEST 6: Worker crash recovery (SIGKILL of a worker process)")
     logger.info("─" * 55)
 
     queue = "crash_recovery_test"
+    from database import execute
+    await execute(f"DELETE FROM jobs WHERE queue_name='{queue}'")
+    job_id = await qm.enqueue(Job(job_type="crash_job", payload={}, queue_name=queue))
 
-    async def handle_never_finishes(payload):
-        # This simulates a job that a crashed worker claimed but never finished
-        await asyncio.sleep(9999)
-        return {}
+    proc = mp.get_context("spawn").Process(target=_victim_process, args=(queue,))
+    proc.start()
 
-    job_id = await qm.enqueue(Job(
-        job_type="crash_job",
-        payload={},
-        queue_name=queue,
-    ))
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        row = await fetch_one("SELECT status FROM jobs WHERE id = $1", job_id)
+        if row["status"] == "running":
+            break
+        await asyncio.sleep(0.2)
+    else:
+        proc.kill()
+        return f"FAIL: Job not claimed within 15s (status={row['status']})"
 
-    # Start victim worker — will claim the job
-    victim = Worker(qm, queue_names=[queue], worker_id="victim-worker")
-    victim.register_handler("crash_job", handle_never_finishes)
-    victim_task = asyncio.create_task(victim.start())
-
-    # Let it claim
+    # Let at least one lease renewal happen, then kill without cleanup.
     await asyncio.sleep(3)
-    row = await fetch_one("SELECT status, worker_id FROM jobs WHERE id = $1", job_id)
-    if row["status"] not in ("claimed", "running"):
-        victim_task.cancel()
-        await asyncio.gather(victim_task, return_exceptions=True)
-        return f"FAIL: Job not claimed within 3s (status={row['status']})"
+    proc.kill()
+    proc.join()
+    killed_at = time.monotonic()
+    logger.info("✓ Victim worker process SIGKILLed while job was running")
 
-    logger.info("✓ Job claimed by victim-worker")
-
-    # CRASH the victim (hard cancel, no cleanup)
-    victim_task.cancel()
-    await asyncio.gather(victim_task, return_exceptions=True)
-    logger.info("✓ Victim worker killed (simulated crash)")
-
-    # Start recovery worker
     async def handle_crash_job_fast(payload):
         return {"recovered": True}
 
+    saved = config.queue.recovery_interval_sec
+    config.queue.recovery_interval_sec = 1
     recovery = Worker(qm, queue_names=[queue], worker_id="recovery-worker")
     recovery.register_handler("crash_job", handle_crash_job_fast)
     recovery_task = asyncio.create_task(recovery.start())
 
-    # Wait for recovery (up to 60s)
-    deadline = time.monotonic() + 60
     recovered = False
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        row = await fetch_one(
-            "SELECT status, worker_id FROM jobs WHERE id = $1", job_id
-        )
+        row = await fetch_one("SELECT status, attempt_count FROM jobs WHERE id = $1", job_id)
         if row["status"] == "completed":
-            logger.info("✓ Job recovered and completed by %s", row["worker_id"])
             recovered = True
             break
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.2)
 
     recovery_task.cancel()
     await asyncio.gather(recovery_task, return_exceptions=True)
+    config.queue.recovery_interval_sec = saved
+    await execute("DELETE FROM workers WHERE id IN ('victim-worker', 'recovery-worker')")
 
     if not recovered:
-        return "FAIL: Job not recovered within 60s"
+        return "FAIL: Job not recovered within 30s"
+    if row["attempt_count"] != 2:
+        return f"FAIL: Expected attempt_count=2 after recovery, got {row['attempt_count']}"
 
-    logger.info("✓ PASS: Crash recovery confirmed")
+    logger.info("✓ PASS: Job recovered and completed %.1fs after crash (lease=6s)",
+                time.monotonic() - killed_at)
     return PASS
 
 
@@ -350,8 +361,7 @@ async def main():
         ("dead_letter",     test_dead_letter),
         ("priority_order",  test_priority_ordering),
         ("lease_renewal",   test_lease_renewal),
-        # Uncomment after setting lease_duration_sec=8 in config.py:
-        # ("crash_recovery",  test_crash_recovery),
+        ("crash_recovery",  test_crash_recovery),
     ]
 
     results = {}
@@ -376,7 +386,8 @@ async def main():
     logger.info("Score: %d / %d", passed, total)
 
     await close_pool()
+    return passed == total
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(0 if asyncio.run(main()) else 1)
