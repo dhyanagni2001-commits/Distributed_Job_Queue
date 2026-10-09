@@ -204,6 +204,35 @@ python chaos_test.py
 
 These tests validate the scenarios implemented in this repository. They are not a formal proof of exactly-once execution or production reliability.
 
+## Benchmarks
+
+Measured with `benchmark.py` on an Apple M5 Pro (15 cores), PostgreSQL 16 in Docker, Python 3.11, asyncpg 0.29. Workers ran as asyncio tasks in one process and shared one connection pool (max 40). Handlers are no-ops, so these numbers show the queue's overhead and do not include any real work. The table shows two runs of 2,000 jobs each.
+
+| Metric | Run 1 | Run 2 |
+| --- | ---: | ---: |
+| Enqueue rate (single producer, sequential) | 919 jobs/s | 865 jobs/s |
+| Claim latency p50 / p99 | 1.21 / 1.92 ms | 1.30 / 1.65 ms |
+| Throughput, 1 worker | 162 jobs/s | 162 jobs/s |
+| Throughput, 2 workers | 401 jobs/s | 393 jobs/s |
+| Throughput, 4 workers | 551 jobs/s | 612 jobs/s |
+| Throughput, 8 workers | 825 jobs/s | 773 jobs/s |
+| Throughput, 16 workers | 1,119 jobs/s | 1,116 jobs/s |
+| Duplicate completions (all runs) | 0 | 0 |
+
+Throughput goes up as workers are added (about 6.9x from 1 to 16 workers), but each added worker contributes less. A single worker makes about 6 database round trips per job (claim, event log, mark running, heartbeat, complete, stats), so it is limited by round-trip latency. With 16 workers, contention on PostgreSQL becomes the limit. Your numbers will differ on other hardware or with real handlers.
+
+The `chaos_test.py` suite passes all 5 scenarios (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, and 25-second lease renewal). The full suite takes about 30 seconds.
+
+Reproduce:
+
+```bash
+docker run -d --name djq-bench -e POSTGRES_DB=jobqueue2 -e POSTGRES_USER=jobqueue \
+  -e POSTGRES_PASSWORD=jobqueue -p 5439:5432 postgres:16-alpine
+export DB_PORT=5439 DB_USER=jobqueue DB_PASSWORD=jobqueue
+python benchmark.py
+python chaos_test.py
+```
+
 ## Design Tradeoffs
 
 ### Why PostgreSQL?
@@ -247,7 +276,7 @@ It focuses on PostgreSQL-backed job coordination and does not attempt to provide
 Possible future improvements include:
 
 - Automated unit and integration tests in CI
-- Reproducible load tests with documented hardware and workload settings
+- Load tests with real (non-no-op) handlers and workers spread across separate processes and hosts
 - Fairness controls to reduce priority starvation
 - PostgreSQL `LISTEN/NOTIFY` to reduce idle polling
 - Retention and archival policies for completed jobs
@@ -268,6 +297,7 @@ Possible future improvements include:
 ├── main.py                 # Entry point and example handlers
 ├── prometheus_exporter.py  # Prometheus metrics endpoint
 ├── chaos_test.py           # Failure-oriented test scenarios
+├── benchmark.py            # Throughput and claim-latency benchmark
 ├── abstract_backend.py     # Queue backend interface
 ├── scale_story.md          # Notes about scaling considerations
 ├── Dockerfile
