@@ -3,17 +3,23 @@
 ## Current Architecture Limits
 
 This system uses PostgreSQL as its job queue backbone.
-It works excellently up to a point. Here are the exact breaking points,
-the symptoms, and the migration path for each.
+It works well up to a point. Below are the likely breaking points, the
+symptoms, and the migration path for each.
+
+Only the numbers that come from `benchmark.py` (see the README) are measured:
+about 17,800 jobs/s sustained with 16 workers and no-op handlers on one
+machine, with PostgreSQL CPU as the limit. Worker counts and thresholds in
+this document are **estimates** that have not been benchmarked.
 
 ---
 
-## Breaking Point 1: Connection Saturation (~200-500 workers)
+## Breaking Point 1: Connection Saturation
 
 ### What happens
-Each asyncpg worker holds 2-10 connections in its pool.
-PostgreSQL default max_connections = 100.
-At ~50 workers you exhaust connections. Workers start timing out on acquire().
+Each worker *process* holds an asyncpg pool of 2-10 connections, shared by
+all workers in that process. PostgreSQL's default max_connections is 100, so
+about 10 worker processes at full pool size exhaust it. Workers then start
+timing out on acquire().
 
 ### Symptoms
 ```
@@ -21,7 +27,7 @@ asyncpg.exceptions.TooManyConnectionsError
 connection pool exhausted, timeout acquiring connection
 ```
 
-### Fix (buys you to ~2000 workers)
+### Fix (estimated to reach thousands of worker connections)
 Add PgBouncer as a connection pooler in front of PostgreSQL.
 
 ```ini
@@ -42,15 +48,18 @@ host: str = os.getenv("DB_HOST", "pgbouncer")   # port 6432
 
 ---
 
-## Breaking Point 2: Row Lock Contention (~1000+ jobs/sec)
+## Breaking Point 2: Claim Hot Spot and Database CPU
 
-### Measured threshold
-- < 100 workers: negligible contention, sub-millisecond claim latency
-- 100–500 workers: ~5ms claim latency
-- 500–1000 workers: ~20ms claim latency
-- 1000+ workers: DB CPU saturates, claim latency > 100ms
+### What was measured
+- Single-job claim latency: p50 about 1.05 ms, p99 1.32-1.45 ms (one claimer).
+- With 16 workers and batch size 50, PostgreSQL used about 470% CPU and
+  throughput was the same whether workers ran in 1 or 4 processes, so the
+  database is the bottleneck at that point.
+- Claim latency under hundreds of concurrent workers has **not** been measured.
+  `SKIP LOCKED` avoids lock waits, so the expected symptom is rising DB CPU
+  and claim latency rather than blocking.
 
-### Fix: Queue partitioning (buys you to ~5000 workers)
+### Fix: Queue partitioning (estimate, not benchmarked)
 
 ```sql
 CREATE TABLE jobs (
@@ -124,13 +133,16 @@ ALTER TABLE jobs SET (
 
 ## When to Migrate Away from PostgreSQL
 
-| Throughput     | Workers  | Recommended stack                          |
-|----------------|----------|--------------------------------------------|
-| < 1k jobs/min  | < 100    | This system as-is                          |
-| < 10k jobs/min | < 500    | This system + PgBouncer + partitioning     |
-| < 100k/min     | < 2000   | Redis Streams or Celery + Redis            |
-| > 100k/min     | 2000+    | Apache Kafka or AWS SQS + Lambda           |
-| > 1M/min       | unbounded| Kafka + consumer groups + Kubernetes       |
+Rough guidance (estimates; real handlers, payload sizes and the rest of the
+database's workload matter more than these numbers):
+
+| Situation                                              | Recommended stack                      |
+|--------------------------------------------------------|----------------------------------------|
+| Hundreds to a few thousand real jobs/s, Postgres already in the stack | This system as-is             |
+| Many worker processes, connection pressure             | This system + PgBouncer (transaction mode) |
+| Queue traffic hurting the main database                | Dedicated Postgres for the queue, partitioning |
+| Fan-out, replay, retention, or isolation needed        | Redis Streams, RabbitMQ, or SQS        |
+| Sustained very high volume across many consumers       | Kafka + consumer groups                |
 
 ---
 
@@ -162,10 +174,10 @@ class AbstractQueueBackend(ABC):
         """Atomically claim the next available job."""
 
     @abstractmethod
-    async def complete_job(self, result: JobResult): ...
+    async def complete_job(self, result: JobResult, worker_id: str) -> bool: ...
 
     @abstractmethod
-    async def fail_job(self, result: JobResult, max_attempts: int): ...
+    async def fail_job(self, result: JobResult, max_attempts: int, worker_id: str) -> bool: ...
 
     @abstractmethod
     async def renew_lease(
@@ -187,11 +199,11 @@ qm = Backend(bootstrap_servers="kafka:9092")
 
 | Dimension          | This system       | AWS SQS           | Apache Kafka     | Celery + Redis   |
 |--------------------|-------------------|-------------------|------------------|------------------|
-| Exactly-once       | YES (DB locks)    | at-least-once     | at-least-once    | at-least-once    |
-| Max throughput     | ~10k/min          | unlimited         | millions/sec     | ~50k/min         |
+| Delivery           | at-least-once (exclusive claiming via row locks) | at-least-once | at-least-once (exactly-once only within Kafka transactions) | at-least-once (with late acks) |
+| Throughput         | ~17.8k jobs/s measured (no-op handlers, 1 machine) | very high (managed) | millions/sec | high |
 | Operational cost   | low (1 DB)        | zero (managed)    | high (cluster)   | medium (Redis)   |
 | Query/debug jobs   | YES (SQL)         | no SQL            | no SQL           | limited          |
-| Ordered delivery   | YES (priority)    | no order          | per partition    | no order         |
+| Ordered delivery   | priority, best effort | no order (FIFO queues available) | per partition | no order |
 | Scheduled jobs     | YES (scheduled_at)| delay queues      | external needed  | YES (eta param)  |
 | Dead letter        | YES (same DB)     | DLQ native        | separate topic   | native           |
 | Multi-region       | needs replication | built-in          | built-in         | needs setup      |

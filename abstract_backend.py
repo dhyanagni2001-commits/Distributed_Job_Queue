@@ -50,15 +50,19 @@ class AbstractQueueBackend(ABC):
         """Transition a claimed job to running status."""
 
     @abstractmethod
-    async def complete_job(self, result: JobResult):
-        """Mark a job as completed and store the result."""
+    async def complete_job(self, result: JobResult, worker_id: str) -> bool:
+        """
+        Mark a job as completed and store the result.
+        Only succeeds if worker_id still owns the job; returns False otherwise.
+        """
 
     @abstractmethod
-    async def fail_job(self, result: JobResult, max_attempts: int):
+    async def fail_job(self, result: JobResult, max_attempts: int, worker_id: str) -> bool:
         """
         Mark a job attempt as failed.
         If attempt_count < max_attempts: re-queue for retry.
         If attempt_count >= max_attempts: mark permanently failed.
+        Only applies if worker_id still owns the job; returns False otherwise.
         """
 
     # ------------------------------------------------------------------
@@ -84,8 +88,8 @@ class AbstractQueueBackend(ABC):
     @abstractmethod
     async def recover_expired_leases(self) -> int:
         """
-        Reset jobs with expired leases back to pending.
-        Safe to call concurrently from multiple workers.
+        Reset jobs with expired leases back to pending, or to dead_letter if
+        their attempts are used up. Safe to call concurrently from multiple workers.
         Returns count of recovered jobs.
         """
 

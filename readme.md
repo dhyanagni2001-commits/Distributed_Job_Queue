@@ -10,7 +10,7 @@ The project explores how background job systems handle concurrent claiming, retr
 - About 37,000–40,000 jobs/s bulk enqueue with idempotency-key deduplication
 - Claim latency: p50 1.05–1.06 ms, p99 1.32–1.45 ms
 - Zero duplicate completions across all benchmark runs (see [definition](#how-duplicates-are-detected))
-- A job held by a SIGKILLed worker process was recovered and completed 5.1 s after the kill, with a 6 s lease
+- A job held by a SIGKILLed worker process was recovered and completed 5-6 s after the kill, with a 6 s lease
 
 ## Motivation
 
@@ -31,9 +31,10 @@ I built this project to explore the following questions:
 - Bulk enqueue with idempotency-key deduplication
 - Multiple asynchronous workers
 - Lease-based recovery of interrupted jobs
-- Periodic lease renewal for long-running jobs
+- Periodic lease renewal for long-running jobs, with handlers cancelled if their lease is lost
+- Ownership checks on completion and failure, so a stalled worker cannot overwrite a job another worker has reclaimed
 - Configurable retry attempts and retry delays
-- Dead-letter handling after retry exhaustion
+- Dead-letter handling after retry exhaustion, including jobs whose worker keeps dying (lease recovery dead-letters them once attempts are used up)
 - Priority-based job selection
 - Idempotency keys for duplicate job submissions
 - Worker heartbeats and job event history
@@ -69,7 +70,8 @@ PostgreSQL stores both the job data and its processing state. Workers use row-le
 5. Successful jobs are marked as completed together in one statement.
 6. Failed jobs return to the queue after a configured delay.
 7. Jobs that exhaust their allowed attempts are moved to the dead-letter state.
-8. If a worker stops and its lease expires, another worker can recover the job.
+8. If a worker stops and its lease expires, another worker can recover the job. If the expired attempt was the last one allowed, the job is dead-lettered instead.
+9. Completion, failure, and lease renewal only apply while the worker still owns the job (`worker_id` matches and the job is running). A worker that stalls past its lease cannot complete or fail a job that has since been reclaimed. If its lease renewal fails, it cancels that job's handler.
 
 ## Delivery Semantics
 
@@ -77,7 +79,7 @@ The queue provides **at-least-once execution** with exclusive claiming of curren
 
 `SELECT FOR UPDATE SKIP LOCKED` prevents workers from claiming the same available row at the same time. However, a job may run more than once if a worker performs a side effect and stops before recording successful completion.
 
-Handlers that produce external side effects should therefore be idempotent or use a separate deduplication mechanism.
+Ownership checks prevent a stalled worker from *recording* a result for a job it no longer owns, but they cannot undo a side effect it already performed. Handlers that produce external side effects should therefore be idempotent or use a separate deduplication mechanism.
 
 Idempotency keys in this project prevent duplicate job submissions. They do not guarantee that an external side effect occurs only once.
 
@@ -207,6 +209,10 @@ The failure-oriented test suite covers:
 - Priority-based job selection
 - Lease renewal for a 25-second job
 - Crash recovery: a worker running in a separate OS process is killed with SIGKILL mid-job, and the test checks that another worker recovers and completes the job after the lease expires
+- Fencing: a worker whose lease expired and whose job was reclaimed cannot renew, complete, or fail that job, and the new owner's result is the one stored
+- Poison pill: a job that loses its worker on every attempt is dead-lettered by lease recovery, with `lease_expired` and `dead_lettered` events logged
+- Lost lease in a batch: when another worker takes over one job in a batch, the renewal loop cancels that job's handler while the rest of the batch completes normally
+- Batch lease hold: a job that finishes early keeps its lease until the rest of its batch (which outlives the lease several times) is recorded, so it is not reclaimed and re-run
 
 Run the tests with:
 
@@ -261,7 +267,7 @@ The first version handled one job per claim and made about 9 database round trip
 
 A duplicate completion is a job with more than one `completed` row in `job_events`. The benchmark checks this after every run by grouping completed events by `job_id` (`HAVING COUNT(*) > 1`). This detects a job that the queue marked complete twice. It cannot detect a handler side effect that ran twice before a crash.
 
-The `chaos_test.py` suite passes all 6 scenarios with batching enabled (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, 25-second lease renewal, and recovery after a worker process is SIGKILLed).
+The `chaos_test.py` suite passes all 10 scenarios with batching enabled (idempotency, exclusive claiming across 5 workers, dead-letter, priority order, 25-second lease renewal, recovery after a worker process is SIGKILLed, fencing of a stale worker, poison-pill dead-lettering, lost-lease cancellation, and holding leases for finished jobs in a slow batch).
 
 Reproduce:
 
@@ -294,6 +300,8 @@ A shorter polling interval finds jobs sooner but executes more queries while the
 Leases allow unfinished work to be recovered without keeping a database transaction open while the handler runs.
 
 Short leases improve recovery time but increase the risk of reclaiming a job whose worker is temporarily delayed. Long leases reduce that risk but make recovery from an actual worker failure slower.
+
+When a delayed worker resumes after its job was reclaimed, ownership checks (`worker_id = me AND status = 'running'` on every completion, failure, and renewal) reject its writes, so only the current owner's outcome is recorded. One case is not covered: if the same worker id happens to reclaim the job, a stale write from its earlier attempt would match. A claim token that increments on every claim (a fencing token) would close that gap.
 
 ### Retries
 

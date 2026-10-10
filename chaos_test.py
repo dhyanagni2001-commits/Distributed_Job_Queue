@@ -348,6 +348,198 @@ async def test_crash_recovery(qm: QueueManager) -> str:
     return PASS
 
 
+# ── Test 7: Fencing (a stalled worker cannot finish a reclaimed job) ─────────
+async def test_zombie_fencing(qm: QueueManager) -> str:
+    logger.info("─" * 55)
+    logger.info("TEST 7: Fencing — stale worker cannot complete/fail a reclaimed job")
+    logger.info("─" * 55)
+
+    from database import execute
+    from models import JobResult
+    queue = "fencing_test"
+    await execute("DELETE FROM jobs WHERE queue_name = $1", queue)
+    job_id = await qm.enqueue(Job(job_type="fence_job", payload={}, queue_name=queue))
+
+    # Worker A claims with a 1s lease, then "stalls" past it.
+    [a_job] = await qm.claim_jobs("zombie-a", [queue], lease_sec=1, limit=1)
+    await asyncio.sleep(1.5)
+    await qm.recover_expired_leases()
+    [b_job] = await qm.claim_jobs("fresh-b", [queue], lease_sec=30, limit=1)
+    if b_job.job_id != job_id:
+        return "FAIL: Worker B did not reclaim the job"
+
+    # Worker A wakes up and tries to renew, complete and fail. All must be rejected.
+    renewed = await qm.renew_leases([job_id], "zombie-a")
+    a_completed = await qm.complete_jobs("zombie-a", [JobResult(job_id, True, {"by": "a"})])
+    a_failed = await qm.fail_job(JobResult(job_id, False, error="late"), 3, "zombie-a")
+    if renewed or a_completed or a_failed:
+        return (f"FAIL: Stale worker was not fenced (renewed={bool(renewed)}, "
+                f"completed={a_completed}, failed={a_failed})")
+
+    b_completed = await qm.complete_jobs("fresh-b", [JobResult(job_id, True, {"by": "b"})])
+    row = await fetch_one(
+        """SELECT status, result,
+                  (SELECT COUNT(*) FROM job_events
+                   WHERE job_id = $1 AND event_type = 'completed') AS completions
+           FROM jobs WHERE id = $1""", job_id)
+    if b_completed != 1 or row["status"] != "completed" or row["completions"] != 1:
+        return f"FAIL: Owner completion wrong (status={row['status']}, completions={row['completions']})"
+    if row["result"] != {"by": "b"}:
+        return f"FAIL: Result written by stale worker: {row['result']}"
+
+    logger.info("✓ PASS: Stale worker's renew/complete/fail rejected; owner completed once")
+    return PASS
+
+
+# ── Test 8: Poison pill is dead-lettered by lease recovery ───────────────────
+async def test_poison_pill_recovery(qm: QueueManager) -> str:
+    logger.info("─" * 55)
+    logger.info("TEST 8: Job that keeps losing its worker is dead-lettered")
+    logger.info("─" * 55)
+
+    from database import execute
+    queue = "poison_pill_test"
+    await execute("DELETE FROM jobs WHERE queue_name = $1", queue)
+    job_id = await qm.enqueue(Job(job_type="poison", payload={}, queue_name=queue,
+                                  max_attempts=2))
+
+    # Two attempts, each "crashing" (lease left to expire without completing).
+    for attempt in (1, 2):
+        claimed = await qm.claim_jobs(f"doomed-{attempt}", [queue], lease_sec=1, limit=1)
+        if not claimed:
+            return f"FAIL: Job not claimable on attempt {attempt}"
+        await asyncio.sleep(1.5)
+        await qm.recover_expired_leases()
+
+    row = await fetch_one("SELECT status, attempt_count, last_error FROM jobs WHERE id = $1",
+                          job_id)
+    if row["status"] != "dead_letter":
+        return f"FAIL: Expected dead_letter after 2 lost leases, got {row['status']}"
+    events = await fetch_all(
+        "SELECT event_type FROM job_events WHERE job_id = $1 "
+        "AND event_type IN ('lease_expired', 'dead_lettered') ORDER BY id", job_id)
+    if [e["event_type"] for e in events] != ["lease_expired", "dead_lettered"]:
+        return f"FAIL: Recovery events not logged: {[e['event_type'] for e in events]}"
+
+    logger.info("✓ PASS: Dead-lettered after %d lost leases, recovery events logged",
+                row["attempt_count"])
+    return PASS
+
+
+# ── Test 9: Batch renewal notices a lost lease and cancels the handler ───────
+async def test_lost_lease_cancels_handler(qm: QueueManager) -> str:
+    logger.info("─" * 55)
+    logger.info("TEST 9: Lost lease in a batch cancels that job's handler")
+    logger.info("─" * 55)
+
+    from database import execute
+    queue = "lost_lease_test"
+    await execute("DELETE FROM jobs WHERE queue_name = $1", queue)
+    stolen_id = await qm.enqueue(Job(job_type="slow", payload={"stolen": True}, queue_name=queue))
+    kept_id = await qm.enqueue(Job(job_type="slow", payload={"stolen": False}, queue_name=queue))
+
+    cancelled = []
+
+    async def handle_slow(payload):
+        try:
+            await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            cancelled.append(payload["stolen"])
+            raise
+        return {"done": True}
+
+    saved = config.queue.lease_renewal_interval_sec
+    config.queue.lease_renewal_interval_sec = 1
+    w = Worker(qm, queue_names=[queue], worker_id="lease-loser")
+    w.register_handler("slow", handle_slow)
+    task = asyncio.create_task(w.start())
+    try:
+        # Wait until both jobs are running, then simulate another worker taking one.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            row = await fetch_one("SELECT COUNT(*) AS n FROM jobs WHERE queue_name = $1 "
+                                  "AND status = 'running'", queue)
+            if row["n"] == 2:
+                break
+            await asyncio.sleep(0.1)
+        await execute("UPDATE jobs SET worker_id = 'thief' WHERE id = $1", stolen_id)
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            row = await fetch_one("SELECT status FROM jobs WHERE id = $1", kept_id)
+            if row["status"] == "completed":
+                break
+            await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        config.queue.lease_renewal_interval_sec = saved
+        await execute("DELETE FROM workers WHERE id = 'lease-loser'")
+
+    stolen = await fetch_one("SELECT status, worker_id FROM jobs WHERE id = $1", stolen_id)
+    kept = await fetch_one("SELECT status FROM jobs WHERE id = $1", kept_id)
+    if cancelled != [True]:
+        return f"FAIL: Expected only the stolen job's handler cancelled, got {cancelled}"
+    if stolen["status"] != "running" or stolen["worker_id"] != "thief":
+        return f"FAIL: Stolen job was modified by the loser: {dict(stolen)}"
+    if kept["status"] != "completed":
+        return f"FAIL: Job that kept its lease did not complete: {kept['status']}"
+
+    logger.info("✓ PASS: Lost-lease handler cancelled; the other job completed")
+    return PASS
+
+
+# ── Test 10: Finished job keeps its lease while the batch is still running ───
+async def test_batch_holds_finished_leases(qm: QueueManager) -> str:
+    logger.info("─" * 55)
+    logger.info("TEST 10: Fast job in a slow batch is not reclaimed before completion")
+    logger.info("─" * 55)
+
+    from database import execute
+    queue = "batch_lease_test"
+    await execute("DELETE FROM jobs WHERE queue_name = $1", queue)
+    fast_id = await qm.enqueue(Job(job_type="timed", payload={"sec": 0}, queue_name=queue))
+    await qm.enqueue(Job(job_type="timed", payload={"sec": 5}, queue_name=queue))
+
+    async def handle_timed(payload):
+        await asyncio.sleep(payload["sec"])
+        return {}
+
+    saved = (config.queue.lease_duration_sec, config.queue.lease_renewal_interval_sec)
+    config.queue.lease_duration_sec, config.queue.lease_renewal_interval_sec = 2, 0.5
+    w = Worker(qm, queue_names=[queue], worker_id="batch-holder")
+    w.register_handler("timed", handle_timed)
+    task = asyncio.create_task(w.start())
+    try:
+        # The slow job outlives the 2s lease several times over; keep running
+        # recovery the way other workers would.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            await qm.recover_expired_leases()
+            row = await fetch_one("SELECT COUNT(*) AS n FROM jobs WHERE queue_name = $1 "
+                                  "AND status = 'completed'", queue)
+            if row["n"] == 2:
+                break
+            await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        config.queue.lease_duration_sec, config.queue.lease_renewal_interval_sec = saved
+        await execute("DELETE FROM workers WHERE id = 'batch-holder'")
+
+    row = await fetch_one(
+        """SELECT status, attempt_count,
+                  (SELECT COUNT(*) FROM job_events WHERE job_id = $1
+                   AND event_type = 'lease_expired') AS expiries
+           FROM jobs WHERE id = $1""", fast_id)
+    if row["status"] != "completed" or row["attempt_count"] != 1 or row["expiries"]:
+        return (f"FAIL: Fast job lost its lease while waiting for the batch "
+                f"(status={row['status']}, attempts={row['attempt_count']}, expiries={row['expiries']})")
+
+    logger.info("✓ PASS: Fast job kept its lease and completed on the first attempt")
+    return PASS
+
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 async def main():
     await init_pool()
@@ -362,6 +554,10 @@ async def main():
         ("priority_order",  test_priority_ordering),
         ("lease_renewal",   test_lease_renewal),
         ("crash_recovery",  test_crash_recovery),
+        ("zombie_fencing",  test_zombie_fencing),
+        ("poison_pill",     test_poison_pill_recovery),
+        ("lost_lease",      test_lost_lease_cancels_handler),
+        ("batch_lease",     test_batch_holds_finished_leases),
     ]
 
     results = {}

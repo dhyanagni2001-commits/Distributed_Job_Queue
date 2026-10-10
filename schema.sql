@@ -216,7 +216,9 @@ END;
 $$;
 
 -- ============================================================
--- Recover expired leases (called by any worker periodically)
+-- Recover expired leases (called by any worker periodically).
+-- A job whose attempts are used up goes straight to dead_letter, so a job
+-- that crashes its worker every time cannot loop forever.
 -- ============================================================
 CREATE OR REPLACE FUNCTION recover_expired_leases()
 RETURNS INTEGER LANGUAGE plpgsql AS $$
@@ -224,15 +226,35 @@ DECLARE
     recovered INTEGER;
 BEGIN
     WITH expired AS (
-        UPDATE jobs SET
-            status           = 'pending',
+        UPDATE jobs j SET
+            status           = CASE WHEN j.attempt_count >= j.max_attempts
+                                    THEN 'dead_letter'::job_status
+                                    ELSE 'pending'::job_status END,
+            last_error       = CASE WHEN j.attempt_count >= j.max_attempts
+                                    THEN 'Lease expired on final attempt (worker lost)'
+                                    ELSE j.last_error END,
+            last_error_at    = CASE WHEN j.attempt_count >= j.max_attempts
+                                    THEN NOW() ELSE j.last_error_at END,
             worker_id        = NULL,
             lease_expires_at = NULL,
             claimed_at       = NULL,
             updated_at       = NOW()
-        WHERE status IN ('claimed', 'running')
-          AND lease_expires_at < NOW()
-        RETURNING id
+        FROM (
+            SELECT id, worker_id AS old_worker_id FROM jobs
+            WHERE status IN ('claimed', 'running')
+              AND lease_expires_at < NOW()
+            FOR UPDATE SKIP LOCKED
+        ) old
+        WHERE j.id = old.id
+        RETURNING j.id, j.status, j.attempt_count, old.old_worker_id
+    ), ev AS (
+        INSERT INTO job_events (job_id, worker_id, event_type, message)
+        SELECT id, old_worker_id,
+               CASE WHEN status = 'dead_letter' THEN 'dead_lettered' ELSE 'lease_expired' END,
+               'Lease held by ' || COALESCE(old_worker_id, '?') || ' expired on attempt '
+                   || attempt_count
+                   || CASE WHEN status = 'dead_letter' THEN '; attempts exhausted' ELSE '; requeued' END
+        FROM expired
     )
     SELECT COUNT(*) INTO recovered FROM expired;
 
@@ -313,7 +335,9 @@ $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Batched completion: marks jobs completed, writes completed events, and
--- updates the worker's counter in a single round trip.
+-- updates the worker's counter in a single round trip. Only jobs this worker
+-- still owns are completed; a job whose lease expired and was reclaimed is
+-- skipped, so a stalled worker cannot complete another worker's job.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION complete_jobs(
     p_worker_id TEXT,
@@ -332,7 +356,10 @@ LANGUAGE sql AS $$
             completed_at = NOW(),
             updated_at   = NOW(),
             worker_id    = NULL
-        FROM input WHERE j.id = input.id
+        FROM input
+        WHERE j.id = input.id
+          AND j.worker_id = p_worker_id
+          AND j.status = 'running'
         RETURNING j.id, input.duration
     ), ev AS (
         INSERT INTO job_events (job_id, event_type, message, metadata)

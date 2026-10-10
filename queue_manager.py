@@ -187,17 +187,20 @@ class QueueManager:
             )
 
     async def renew_leases(self, job_ids: List[uuid.UUID], worker_id: str,
-                           lease_sec: int = 30) -> int:
+                           lease_sec: int = 30) -> set[uuid.UUID]:
+        """Extend leases on jobs this worker still owns. Returns the IDs that
+        were renewed; any ID missing from the result has been lost."""
         async with acquire() as conn:
-            res = await conn.execute(
+            rows = await conn.fetch(
                 """
                 UPDATE jobs SET lease_expires_at = NOW() + make_interval(secs => $3),
                                 updated_at = NOW()
                 WHERE id = ANY($1) AND worker_id = $2 AND status = 'running'
+                RETURNING id
                 """,
                 job_ids, worker_id, lease_sec,
             )
-            return int(res.split()[-1])
+            return {r["id"] for r in rows}
 
     # ------------------------------------------------------------------
     # Mark running
@@ -216,9 +219,10 @@ class QueueManager:
     # ------------------------------------------------------------------
     # Complete
     # ------------------------------------------------------------------
-    async def complete_job(self, result: JobResult):
+    async def complete_job(self, result: JobResult, worker_id: str) -> bool:
+        """Returns False if the worker no longer owns the job (lease lost)."""
         async with acquire() as conn:
-            await conn.execute(
+            res = await conn.execute(
                 """
                 UPDATE jobs SET
                     status       = 'completed',
@@ -226,72 +230,75 @@ class QueueManager:
                     completed_at = NOW(),
                     updated_at   = NOW(),
                     worker_id    = NULL
-                WHERE id = $2
+                WHERE id = $2 AND worker_id = $3 AND status IN ('claimed', 'running')
                 """,
                 result.result or {},
                 result.job_id,
+                worker_id,
             )
+            if res.split()[-1] == "0":
+                logger.warning("Job %s not completed: lease lost by %s",
+                               result.job_id, worker_id)
+                return False
             await self._log_event(
                 conn, result.job_id, None, EventType.COMPLETED,
                 f"Completed in {result.duration_sec:.3f}s",
                 {"duration_sec": result.duration_sec},
             )
+            return True
 
     # ------------------------------------------------------------------
     # Fail / retry
     # ------------------------------------------------------------------
-    async def fail_job(self, result: JobResult, max_attempts: int):
+    async def fail_job(self, result: JobResult, max_attempts: int, worker_id: str) -> bool:
+        """Retry or permanently fail a job in one statement. Only applies if
+        `worker_id` still owns the job; returns False if the lease was lost."""
         async with acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT attempt_count, retry_delay_sec FROM jobs WHERE id = $1",
-                result.job_id,
-            )
-            if not row:
-                return
-
-            attempt = row["attempt_count"]
-            delay = row["retry_delay_sec"]
-
-            if attempt < max_attempts:
-                await conn.execute(
-                    """
+                """
+                WITH upd AS (
                     UPDATE jobs SET
-                        status           = 'pending',
+                        status           = CASE WHEN attempt_count < $2
+                                                THEN 'pending'::job_status
+                                                ELSE 'failed'::job_status END,
+                        scheduled_at     = CASE WHEN attempt_count < $2
+                                                THEN NOW() + make_interval(secs => retry_delay_sec)
+                                                ELSE scheduled_at END,
                         worker_id        = NULL,
                         lease_expires_at = NULL,
-                        last_error       = $1,
+                        last_error       = $3,
                         last_error_at    = NOW(),
-                        scheduled_at     = NOW() + ($2 * '1 second'::interval),
                         updated_at       = NOW()
-                    WHERE id = $3
-                    """,
-                    result.error, delay, result.job_id,
+                    WHERE id = $1 AND worker_id = $4 AND status IN ('claimed', 'running')
+                    RETURNING id, status, attempt_count, retry_delay_sec
+                ), ev AS (
+                    INSERT INTO job_events (job_id, worker_id, event_type, message)
+                    SELECT id, $4,
+                           CASE WHEN status = 'pending' THEN 'retried' ELSE 'failed' END,
+                           CASE WHEN status = 'pending'
+                                THEN 'Attempt ' || attempt_count || '/' || $2 || ' failed; retry in '
+                                     || retry_delay_sec || 's. Error: ' || $3
+                                ELSE 'Permanently failed after ' || attempt_count
+                                     || ' attempts. Error: ' || $3 END
+                    FROM upd
                 )
-                await self._log_event(
-                    conn, result.job_id, None, EventType.RETRIED,
-                    f"Attempt {attempt}/{max_attempts} failed; retry in {delay}s. Error: {result.error}",
-                )
+                SELECT status::text AS status, attempt_count, retry_delay_sec FROM upd
+                """,
+                result.job_id, max_attempts, result.error, worker_id,
+            )
+            if row is None:
+                logger.warning("Failure for job %s not recorded: lease lost by %s",
+                               result.job_id, worker_id)
+                return False
+
+            if row["status"] == "pending":
                 logger.warning("Job %s attempt %d/%d failed, retrying in %ds",
-                               result.job_id, attempt, max_attempts, delay)
+                               result.job_id, row["attempt_count"], max_attempts,
+                               row["retry_delay_sec"])
             else:
-                await conn.execute(
-                    """
-                    UPDATE jobs SET
-                        status        = 'failed',
-                        worker_id     = NULL,
-                        last_error    = $1,
-                        last_error_at = NOW(),
-                        updated_at    = NOW()
-                    WHERE id = $2
-                    """,
-                    result.error, result.job_id,
-                )
-                await self._log_event(
-                    conn, result.job_id, None, EventType.FAILED,
-                    f"Permanently failed after {attempt} attempts. Error: {result.error}",
-                )
                 logger.error("Job %s permanently failed after %d attempts",
-                             result.job_id, attempt)
+                             result.job_id, row["attempt_count"])
+            return True
 
     # ------------------------------------------------------------------
     # Lease renewal
